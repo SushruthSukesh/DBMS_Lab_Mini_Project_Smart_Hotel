@@ -1,0 +1,20 @@
+{
+  "_id": "guest-1001",
+  "guestId": 1,
+  "preferences": {
+    "bedType": "King",
+    "floorPreference": "High",
+    "dietaryRestrictions": ["Vegetarian"],
+    "amenities": ["Gym", "Airport Shuttle"]
+  },
+  "stayHistory": [
+    {
+      "reservationId": 1,
+      "roomType": "Deluxe King",
+      "rating": 5,
+      "feedback": "Very comfortable room and quick check-in.",
+      "createdAt": "2026-11-13T10:00:00Z"
+    }
+  ],
+  "searchableText": "King room high floor vegetarian gym airport shuttle comfortable quick check-in"
+}

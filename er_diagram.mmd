@@ -1,0 +1,57 @@
+erDiagram
+    GUEST ||--o{ RESERVATION : makes
+    ROOM_TYPE ||--o{ ROOM : classifies
+    ROOM ||--o{ RESERVATION : assigned_to
+    RESERVATION ||--o{ PAYMENT : receives
+    RESERVATION ||--o{ RESERVATION_AUDIT : records
+
+    GUEST {
+        int guest_id PK
+        varchar first_name
+        varchar last_name
+        varchar email UK
+        varchar phone
+        date date_of_birth
+        varchar id_proof
+    }
+    ROOM_TYPE {
+        int room_type_id PK
+        varchar type_name UK
+        decimal price_per_night
+        int capacity
+        varchar amenities
+    }
+    ROOM {
+        int room_id PK
+        int room_number UK
+        int room_type_id FK
+        int floor
+        enum status
+    }
+    RESERVATION {
+        int reservation_id PK
+        int guest_id FK
+        int room_id FK
+        date check_in
+        date check_out
+        int guests_count
+        enum booking_status
+        decimal total_amount
+    }
+    PAYMENT {
+        int payment_id PK
+        int reservation_id FK
+        decimal amount
+        datetime payment_date
+        enum payment_method
+        enum payment_status
+        varchar transaction_id UK
+    }
+    RESERVATION_AUDIT {
+        bigint audit_id PK
+        int reservation_id FK
+        varchar action_name
+        varchar old_status
+        varchar new_status
+        timestamp changed_at
+    }
