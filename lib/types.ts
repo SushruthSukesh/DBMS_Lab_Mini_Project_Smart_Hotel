@@ -9,7 +9,11 @@ export type DashboardStats = {
 
 export type Reservation = {
   reservation_id: number;
+  guest_id: number;
+  room_id: number;
   guest_name: string;
+  guest_first_name: string;
+  guest_last_name: string;
   email: string;
   room_number: number;
   type_name: string;

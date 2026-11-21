@@ -52,12 +52,48 @@ CREATE TABLE IF NOT EXISTS Reservation (
         NOT NULL DEFAULT 'Pending',
     total_amount DECIMAL(10,2) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (guest_id) REFERENCES Guest(guest_id),
+    CONSTRAINT fk_reservation_guest FOREIGN KEY (guest_id)
+        REFERENCES Guest(guest_id) ON UPDATE CASCADE,
     FOREIGN KEY (room_id) REFERENCES Room(room_id),
     CONSTRAINT chk_reservation_dates CHECK (check_out > check_in),
     CONSTRAINT chk_reservation_guests CHECK (guests_count > 0),
     CONSTRAINT chk_reservation_amount CHECK (total_amount >= 0)
 );
+
+-- Upgrade existing installations so guest ID changes propagate to reservations.
+SET @guest_fk_name = (
+    SELECT CONSTRAINT_NAME
+    FROM information_schema.KEY_COLUMN_USAGE
+    WHERE CONSTRAINT_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'Reservation'
+      AND COLUMN_NAME = 'guest_id'
+      AND REFERENCED_TABLE_NAME = 'Guest'
+    LIMIT 1
+);
+SET @guest_fk_update_rule = (
+    SELECT UPDATE_RULE
+    FROM information_schema.REFERENTIAL_CONSTRAINTS
+    WHERE CONSTRAINT_SCHEMA = DATABASE()
+      AND CONSTRAINT_NAME = @guest_fk_name
+    LIMIT 1
+);
+SET @drop_guest_fk_sql = IF(
+    @guest_fk_name IS NOT NULL AND @guest_fk_update_rule <> 'CASCADE',
+    CONCAT('ALTER TABLE Reservation DROP FOREIGN KEY `',
+           REPLACE(@guest_fk_name, '`', '``'), '`'),
+    'SELECT 1'
+);
+PREPARE drop_guest_fk_stmt FROM @drop_guest_fk_sql;
+EXECUTE drop_guest_fk_stmt;
+DEALLOCATE PREPARE drop_guest_fk_stmt;
+SET @add_guest_fk_sql = IF(
+    @guest_fk_name IS NULL OR @guest_fk_update_rule <> 'CASCADE',
+    'ALTER TABLE Reservation ADD CONSTRAINT fk_reservation_guest FOREIGN KEY (guest_id) REFERENCES Guest(guest_id) ON UPDATE CASCADE',
+    'SELECT 1'
+);
+PREPARE add_guest_fk_stmt FROM @add_guest_fk_sql;
+EXECUTE add_guest_fk_stmt;
+DEALLOCATE PREPARE add_guest_fk_stmt;
 
 CREATE TABLE IF NOT EXISTS Payment (
     payment_id INT PRIMARY KEY AUTO_INCREMENT,
@@ -102,7 +138,11 @@ DROP VIEW IF EXISTS v_active_reservations;
 CREATE VIEW v_active_reservations AS
 SELECT
     r.reservation_id,
+    r.guest_id,
+    r.room_id,
     CONCAT(g.first_name, ' ', g.last_name) AS guest_name,
+    g.first_name AS guest_first_name,
+    g.last_name AS guest_last_name,
     g.email,
     rm.room_number,
     rt.type_name,
@@ -122,7 +162,7 @@ JOIN Room rm ON rm.room_id = r.room_id
 JOIN Room_Type rt ON rt.room_type_id = rm.room_type_id
 LEFT JOIN Payment p ON p.reservation_id = r.reservation_id
 WHERE r.booking_status IN ('Pending', 'Confirmed', 'Checked-in')
-GROUP BY r.reservation_id, g.first_name, g.last_name, g.email, rm.room_number,
+GROUP BY r.reservation_id, r.guest_id, r.room_id, g.first_name, g.last_name, g.email, rm.room_number,
          rt.type_name, r.check_in, r.check_out, r.guests_count,
          r.booking_status, r.total_amount;
 
@@ -130,6 +170,9 @@ DROP TRIGGER IF EXISTS trg_reservation_validate;
 DROP TRIGGER IF EXISTS trg_reservation_audit;
 DROP TRIGGER IF EXISTS trg_guest_validate;
 DROP PROCEDURE IF EXISTS sp_create_reservation;
+DROP PROCEDURE IF EXISTS sp_update_guest;
+DROP PROCEDURE IF EXISTS sp_update_reservation;
+DROP PROCEDURE IF EXISTS sp_delete_reservation;
 
 DELIMITER //
 
@@ -221,6 +264,185 @@ BEGIN
     COMMIT;
 END//
 
+CREATE PROCEDURE sp_update_guest(
+    IN p_original_guest_id INT,
+    IN p_guest_id INT,
+    IN p_first_name VARCHAR(50),
+    IN p_last_name VARCHAR(50)
+)
+BEGIN
+    DECLARE v_temporary_email VARCHAR(100);
+    DECLARE v_email VARCHAR(100);
+    DECLARE v_phone VARCHAR(15);
+    DECLARE v_address VARCHAR(255);
+    DECLARE v_date_of_birth DATE;
+    DECLARE v_id_proof VARCHAR(100);
+    DECLARE v_created_at TIMESTAMP;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    IF p_guest_id IS NULL OR p_guest_id < 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Guest ID must be positive';
+    END IF;
+    IF p_first_name IS NULL OR TRIM(p_first_name) = ''
+       OR CHAR_LENGTH(p_first_name) > 50
+       OR p_last_name IS NULL OR TRIM(p_last_name) = ''
+       OR CHAR_LENGTH(p_last_name) > 50 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Guest first and last names are required';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM Guest WHERE guest_id = p_original_guest_id) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Guest does not exist';
+    END IF;
+    IF p_guest_id <> p_original_guest_id
+       AND EXISTS (SELECT 1 FROM Guest WHERE guest_id = p_guest_id) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Guest ID is already in use';
+    END IF;
+
+    IF p_guest_id = p_original_guest_id THEN
+        UPDATE Guest
+        SET first_name = TRIM(p_first_name),
+            last_name = TRIM(p_last_name)
+        WHERE guest_id = p_original_guest_id;
+    ELSE
+        SELECT email, phone, address, date_of_birth, id_proof, created_at
+        INTO v_email, v_phone, v_address, v_date_of_birth, v_id_proof, v_created_at
+        FROM Guest
+        WHERE guest_id = p_original_guest_id;
+
+        SET v_temporary_email = CONCAT(
+    'guest-',
+    p_guest_id,
+    '-',
+    REPLACE(UUID(), '-', ''),
+    '@temporary.local'
+);
+
+        INSERT INTO Guest
+            (guest_id, first_name, last_name, email, phone, address, date_of_birth, id_proof, created_at)
+        VALUES
+            (p_guest_id, TRIM(p_first_name), TRIM(p_last_name),
+             v_temporary_email, v_phone, v_address, v_date_of_birth, v_id_proof, v_created_at);
+
+        UPDATE Reservation
+        SET guest_id = p_guest_id
+        WHERE guest_id = p_original_guest_id;
+
+        DELETE FROM Guest WHERE guest_id = p_original_guest_id;
+
+        UPDATE Guest
+        SET email = v_email
+        WHERE guest_id = p_guest_id;
+    END IF;
+
+    COMMIT;
+END//
+
+CREATE PROCEDURE sp_update_reservation(
+    IN p_reservation_id INT,
+    IN p_guest_id INT,
+    IN p_room_id INT,
+    IN p_check_in DATE,
+    IN p_check_out DATE,
+    IN p_guests_count INT
+)
+BEGIN
+    DECLARE v_price DECIMAL(10,2);
+    DECLARE v_capacity INT;
+    DECLARE v_exists INT DEFAULT 0;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    SELECT COUNT(*) INTO v_exists
+    FROM Reservation
+    WHERE reservation_id = p_reservation_id
+      AND booking_status IN ('Pending', 'Confirmed');
+
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Reservation does not exist or cannot be edited';
+    END IF;
+    IF p_check_out <= p_check_in THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Check-out must be after check-in';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM Guest WHERE guest_id = p_guest_id) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Guest does not exist';
+    END IF;
+
+    SELECT rt.price_per_night, rt.capacity INTO v_price, v_capacity
+    FROM Room rm
+    JOIN Room_Type rt ON rt.room_type_id = rm.room_type_id
+    WHERE rm.room_id = p_room_id
+    FOR UPDATE;
+
+    IF v_price IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room does not exist';
+    END IF;
+    IF p_guests_count < 1 OR p_guests_count > v_capacity THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Guest count exceeds room capacity';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM Reservation existing
+        WHERE existing.room_id = p_room_id
+          AND existing.reservation_id <> p_reservation_id
+          AND existing.booking_status IN ('Pending', 'Confirmed', 'Checked-in')
+          AND p_check_in < existing.check_out
+          AND p_check_out > existing.check_in
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Room is already reserved for the selected dates';
+    END IF;
+
+    UPDATE Reservation
+    SET guest_id = p_guest_id,
+        room_id = p_room_id,
+        check_in = p_check_in,
+        check_out = p_check_out,
+        guests_count = p_guests_count,
+        total_amount = DATEDIFF(p_check_out, p_check_in) * v_price
+    WHERE reservation_id = p_reservation_id;
+    COMMIT;
+END//
+
+CREATE PROCEDURE sp_delete_reservation(IN p_reservation_id INT)
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+    SELECT COUNT(*) INTO v_exists
+    FROM Reservation
+    WHERE reservation_id = p_reservation_id;
+
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Reservation does not exist';
+    END IF;
+    IF EXISTS (SELECT 1 FROM Payment WHERE reservation_id = p_reservation_id)
+       OR EXISTS (SELECT 1 FROM Reservation_Audit WHERE reservation_id = p_reservation_id) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Reservation has payment or audit history and cannot be deleted';
+    END IF;
+
+    DELETE FROM Reservation WHERE reservation_id = p_reservation_id;
+    COMMIT;
+END//
+
 DELIMITER ;
 
 -- Representative DML seed data.
@@ -299,6 +521,25 @@ SELECT room_type_id, type_name,
 FROM Room_Type
 WHERE MATCH(type_name, description, amenities)
       AGAINST ('+Wi-Fi +Breakfast' IN BOOLEAN MODE);
+
+-- Recursive CTE: report reserved rooms for each of the next 30 days.
+WITH RECURSIVE next_30_days AS (
+    SELECT CURRENT_DATE() AS stay_date
+    UNION ALL
+    SELECT DATE_ADD(stay_date, INTERVAL 1 DAY)
+    FROM next_30_days
+    WHERE stay_date < DATE_ADD(CURRENT_DATE(), INTERVAL 29 DAY)
+)
+SELECT calendar.stay_date,
+       COUNT(DISTINCT r.room_id) AS reserved_rooms,
+       COUNT(DISTINCT r.reservation_id) AS active_reservations
+FROM next_30_days calendar
+LEFT JOIN Reservation r
+    ON calendar.stay_date >= r.check_in
+   AND calendar.stay_date < r.check_out
+   AND r.booking_status IN ('Pending', 'Confirmed', 'Checked-in')
+GROUP BY calendar.stay_date
+ORDER BY calendar.stay_date;
 
 -- DELETE example (restricted to a clearly identified test record).
 -- DELETE FROM Payment WHERE transaction_id = 'TXN-TEST-DELETE';
