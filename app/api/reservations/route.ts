@@ -38,3 +38,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message }, { status });
   }
 }
+
+export async function GET() {
+  try {
+    const [reservations] = await getMySQL().query(
+      "SELECT v.*, r.guest_id, r.room_id FROM v_active_reservations v JOIN Reservation r ON r.reservation_id = v.reservation_id ORDER BY v.check_in, v.reservation_id"
+    );
+    return NextResponse.json({ reservations });
+  } catch (error) {
+    console.error("Reservation lookup failed", error);
+    return NextResponse.json({ error: getErrorMessage(error) }, { status: 503 });
+  }
+}

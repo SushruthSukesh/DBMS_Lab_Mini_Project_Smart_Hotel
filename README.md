@@ -79,10 +79,14 @@ always checked before a recommendation is offered.
 ## Advanced feature highlights
 
 - `sp_create_reservation` calculates the total and commits it atomically.
+- `sp_update_guest` edits a guest's name or ID; changing the ID cascades to all
+  MySQL reservations for that guest.
 - `trg_reservation_validate` rejects invalid dates, capacity violations, and
   overlapping active reservations.
 - `trg_reservation_audit` records booking-status changes.
 - `v_active_reservations` exposes a dashboard-ready balance calculation.
+- A recursive CTE reports reserved rooms and active reservations for the next
+  30 days.
 - Composite indexes accelerate availability and guest-history queries.
 - Full-text search supports amenity-based room discovery.
 
@@ -97,6 +101,14 @@ The API routes are:
 - `POST /api/reservations`: validates the request and calls
   `sp_create_reservation`, preserving the database's transaction and
   double-booking protections.
+- `GET /api/reservations`: lists active reservations.
+- `PATCH /api/reservations/[id]`: updates a pending or confirmed reservation,
+  recalculating its total and checking capacity and date conflicts.
+- `DELETE /api/reservations/[id]`: deletes a reservation only when it has no
+  payment or audit history. The dashboard also provides edit and delete actions.
+- `PATCH /api/guests/[id]`: updates a guest's first name, last name, and ID.
+  Use **Edit guest** in the reservations table; guest ID changes propagate to
+  the guest's MySQL reservations.
 
 Run `npm install`, copy `.env.example` to `.env.local`, configure the MySQL and
 MongoDB URLs, then run `npm run dev`. Database credentials remain server-side.
